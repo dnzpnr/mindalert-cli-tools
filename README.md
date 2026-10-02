@@ -75,3 +75,67 @@ and disables all mentions with `allowed_mentions: {"parse": []}`. Replies rely
 on Discord's default `fail_if_not_exists: true`, so a missing parent cannot
 silently turn into a non-reply. Discord API response bodies are limited to
 8 MiB and are never printed verbatim.
+
+## `mindalert-graph`
+
+`mindalert-graph` reads Outlook mail and Teams channel messages through
+Microsoft Graph. It uses either a direct `MS_GRAPH_ACCESS_TOKEN`, or the
+client-credentials flow with all three of `MS_TENANT_ID`, `MS_CLIENT_ID`, and
+`MS_CLIENT_SECRET`. Tokens and secrets are accepted only through environment
+variables; secret command-line options are rejected.
+
+`MS_GRAPH_API_BASE` defaults to `https://graph.microsoft.com/v1.0`, and
+`MS_LOGIN_BASE` defaults to `https://login.microsoftonline.com`. These are
+primarily test overrides. Plain HTTP is accepted only for loopback addresses,
+and redirects are not followed.
+
+```console
+export MS_TENANT_ID='...'
+export MS_CLIENT_ID='...'
+export MS_CLIENT_SECRET='...'
+mindalert-graph auth-test
+mindalert-graph mail-list --user alerts@example.com --folder inbox --top 50
+mindalert-graph mail-list --user alerts@example.com --body
+printf '%s\n' '{"user":"alerts@example.com","to":["oncall@example.com"],"subject":"Alert","body":"Disk full"}' | mindalert-graph mail-send
+printf '%s\n' '{"user":"alerts@example.com","message_id":"AAMk...","comment":"Acknowledged"}' | mindalert-graph mail-reply
+mindalert-graph teams-read --team TEAM_ID --channel '19:...@thread.tacv2' --top 50
+mindalert-graph teams-read --team TEAM_ID --channel '19:...@thread.tacv2' --thread MESSAGE_ID
+export TEAMS_WEBHOOK_URL='https://...'
+printf '%s\n' '{"text":"Disk full"}' | mindalert-graph teams-post
+```
+
+`mail-send` also accepts an optional `cc` list and `body_type` set to `text`
+or `html`. List commands report incomplete pages as `truncated: true` with a
+full `next_cursor`; pass that value back with `--cursor`. A cursor must remain
+under the configured Graph API origin and path prefix.
+
+The Entra application needs these Microsoft Graph **application** permissions,
+with administrator consent:
+
+- `Mail.Read` for `mail-list`.
+- `Mail.Send` for `mail-send` and `mail-reply`.
+- `ChannelMessage.Read.All` for `teams-read`. This is a Microsoft protected
+  Teams API permission and requires a protected-API access request in addition
+  to tenant administrator consent.
+
+`teams-post` deliberately uses a Teams Workflows webhook instead of Graph.
+Graph's `ChannelMessage.Send` permission is delegated-only; application
+permission can post channel messages only through the migration-only
+`Teamwork.Migrate.All` flow. Set `TEAMS_WEBHOOK_URL` to the Workflows webhook
+URL. Its `sig` query value is treated as a secret and is never printed.
+
+Successful commands write one JSON document to stdout. Errors leave stdout
+empty and write one JSON document to stderr.
+
+| Exit | Meaning |
+|---:|---|
+| 0 | Success |
+| 1 | Microsoft Graph, identity, or Teams webhook rejection |
+| 2 | Usage or configuration error |
+| 3 | Network error or response larger than 8 MiB |
+| 4 | Missing credentials |
+| 5 | Rate limited; `retry_after` reports seconds |
+
+All Graph, identity, and webhook response bodies are limited to 8 MiB and are
+never printed verbatim. Access tokens, client secrets, and Teams webhook `sig`
+values are redacted from every output path.
