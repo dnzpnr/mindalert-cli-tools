@@ -18,6 +18,7 @@ DEFAULT_API_BASE = "https://slack.com/api"
 TOKEN_ENV = "SLACK_BOT_TOKEN"
 API_BASE_ENV = "SLACK_API_BASE"
 TIMEOUT_SECONDS = 30
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class CliError(Exception):
@@ -120,6 +121,28 @@ def parse_json_response(raw: bytes) -> dict[str, Any]:
     return document
 
 
+def read_response_body(response) -> bytes:
+    content_length = response.headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_RESPONSE_BYTES:
+                raise CliError(
+                    "response_too_large",
+                    "Slack response exceeded the 8 MiB limit",
+                    3,
+                )
+        except ValueError:
+            pass
+    raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise CliError(
+            "response_too_large",
+            "Slack response exceeded the 8 MiB limit",
+            3,
+        )
+    return raw
+
+
 def retry_after(headers) -> int:
     try:
         value = int(headers.get("Retry-After", "0"))
@@ -156,8 +179,9 @@ def api_call(
         with build_opener(NoRedirects).open(
             request, timeout=TIMEOUT_SECONDS
         ) as response:
-            document = parse_json_response(response.read())
+            document = parse_json_response(read_response_body(response))
     except HTTPError as error:
+        raw = read_response_body(error)
         if error.code == 429:
             raise CliError(
                 "rate_limited",
@@ -166,7 +190,7 @@ def api_call(
                 retry_after=retry_after(error.headers),
             ) from error
         try:
-            document = parse_json_response(error.read())
+            document = parse_json_response(raw)
         except CliError as parse_error:
             raise CliError("api_error", "Slack API request failed", 1) from parse_error
         code = safe_provider_code(document.get("error"), token)
