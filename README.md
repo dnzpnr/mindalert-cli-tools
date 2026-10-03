@@ -139,3 +139,54 @@ empty and write one JSON document to stderr.
 All Graph, identity, and webhook response bodies are limited to 8 MiB and are
 never printed verbatim. Access tokens, client secrets, and Teams webhook `sig`
 values are redacted from every output path.
+
+## `mindalert-whatsapp`
+
+`mindalert-whatsapp` is a sender-only client for the official WhatsApp Business
+Cloud API. Set `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` in the
+environment. `WHATSAPP_API_BASE` is optional and defaults to
+`https://graph.facebook.com/v23.0`; plain HTTP is accepted only for a loopback
+address used by local tests. Redirects are not followed.
+
+```console
+export WHATSAPP_ACCESS_TOKEN='...'
+export WHATSAPP_PHONE_NUMBER_ID='...'
+mindalert-whatsapp auth-test
+printf '%s\n' '{"to":"905550000001","text":"Disk full"}' | mindalert-whatsapp send
+printf '%s\n' '{"to":"905550000001","template":{"name":"disk_alarm","language":"tr"}}' | mindalert-whatsapp send
+mindalert-whatsapp history
+```
+
+`send` accepts either non-empty `text` (at most 4096 characters) or a
+`template`, but not both. A template has `name`, `language`, and optional
+`components`. Optional `reply_to_message_id` is sent as WhatsApp reply context.
+Tokens are accepted only through the environment; token command-line options
+are rejected.
+
+`history` deliberately reports `unsupported` instead of returning an empty
+list. Cloud API delivers incoming messages only through
+[webhooks](https://developers.facebook.com/docs/whatsapp/cloud-api), so a
+sender-only CLI cannot fetch message history. Free-form text may be sent only
+inside the 24-hour customer service window. Outside that window, use an
+approved template; Meta error `131047` indicates this re-engagement rule. See
+Meta's [send-message and customer-service-window documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/messages/send-messages#customer-service-windows).
+
+Meta currently lists newer Graph API versions, but `v23.0` remains available
+through October 8, 2027; this tool intentionally pins the contract's version.
+See Meta's [Graph API changelog](https://developers.facebook.com/docs/graph-api/changelog).
+
+Successful commands write one JSON document to stdout. Errors leave stdout
+empty and write one JSON document to stderr.
+
+| Exit | Meaning |
+|---:|---|
+| 0 | Success |
+| 1 | WhatsApp Cloud API rejection (`whatsapp_<code>` when Meta supplies a code) |
+| 2 | Usage, configuration, or unsupported-operation error |
+| 3 | Network error or response larger than 8 MiB |
+| 4 | Missing `WHATSAPP_ACCESS_TOKEN` or `WHATSAPP_PHONE_NUMBER_ID` |
+| 5 | Rate limited; `retry_after` is included when Meta sends `Retry-After` |
+
+WhatsApp response bodies are limited to 8 MiB and are never printed verbatim.
+In particular, Meta's `error.message` is never copied to output because it may
+echo an access token.
