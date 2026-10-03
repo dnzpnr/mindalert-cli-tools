@@ -6,7 +6,9 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,30 @@ from typing import Any, Callable
 ROOT_ENV = "MINDALERT_VIDEO_ROOT"
 DEFAULT_TIMEOUT = 900
 DEFAULT_MAX_OUTPUT_SECONDS = 1800.0
+SCANNED_SUFFIXES = {".html", ".css", ".js", ".svg"}
+SKIPPED_PROJECT_DIRS = {".git", "node_modules"}
+CHROME_CANDIDATES = (
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+)
+SOURCE_ATTRIBUTE_RE = re.compile(
+    r"(?i)(?:\b(?:src|href|data)\s*=\s*)(?:[\"'](?P<quoted>[^\"']*)[\"']|(?P<bare>[^\s>]+))"
+)
+CSS_URL_RE = re.compile(
+    r"(?i)\burl\(\s*(?:[\"'](?P<quoted>[^\"']*)[\"']|(?P<bare>[^\s)'\"]+))\s*\)"
+)
+CSS_IMPORT_RE = re.compile(
+    r"(?i)@import\s+(?:url\(\s*)?(?:[\"'](?P<quoted>[^\"']*)[\"']|(?P<bare>[^\s;)]+))"
+)
+JS_IMPORT_RE = re.compile(
+    r"(?i)(?:\bimport\s*\(|\b(?:import|export)\b[^;]*?\bfrom\s*)"
+    r"[\"'](?P<quoted>[^\"']*)[\"']"
+)
+NETWORK_CALL_RE = re.compile(
+    r"(?i)(?:\bfetch\s*\(|\bXMLHttpRequest\s*\(|\bWebSocket\s*\(|"
+    r"\bEventSource\s*\(|\.sendBeacon\s*\()"
+)
 
 
 class CliError(Exception):
@@ -134,6 +160,14 @@ def make_parser() -> SafeArgumentParser:
     subtitles.add_argument("--srt", required=True)
     subtitles.add_argument("--output", required=True)
     common_options(subtitles, output=True)
+
+    check = commands.add_parser("check", help="scan a HyperFrames project")
+    check.add_argument("--project", required=True)
+
+    render = commands.add_parser("render", help="render a HyperFrames project")
+    render.add_argument("--project", required=True)
+    render.add_argument("--output", required=True)
+    common_options(render, output=True)
     return root
 
 
@@ -177,9 +211,192 @@ def validate_path(root: Path, raw: str, *, input_path: bool) -> Path:
     return resolved
 
 
+def validate_project(root: Path, raw: str) -> Path:
+    if not raw or "\x00" in raw or raw.startswith("-"):
+        raise CliError("invalid_argument", "project path is invalid", 2)
+    supplied = Path(raw)
+    candidate = supplied if supplied.is_absolute() else root / supplied
+    try:
+        resolved = candidate.resolve(strict=False)
+        inside = os.path.commonpath((str(root), str(resolved))) == str(root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise CliError("path_escape", "path is outside MINDALERT_VIDEO_ROOT", 2) from error
+    if not inside:
+        raise CliError("path_escape", "path is outside MINDALERT_VIDEO_ROOT", 2)
+    if not resolved.exists():
+        raise CliError("input_not_found", "project directory was not found", 1)
+    if not resolved.is_dir():
+        raise CliError("input_invalid", "project is not a directory", 1)
+    return resolved
+
+
 def executable(name: str) -> str | None:
     found = shutil.which(name)
     return str(Path(found).resolve()) if found else None
+
+
+def configured_executable(variable: str, fallback: str) -> str | None:
+    configured = os.environ.get(variable)
+    if configured is not None:
+        candidate = Path(configured)
+        if not candidate.is_absolute() or not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return None
+        return str(candidate.resolve())
+    found = shutil.which(fallback, path=os.environ.get("PATH", ""))
+    return str(Path(found).resolve()) if found else None
+
+
+def browser_executable() -> str | None:
+    configured = os.environ.get("HYPERFRAMES_BROWSER_PATH")
+    candidates = (configured,) if configured is not None else CHROME_CANDIDATES
+    for raw in candidates:
+        if not raw:
+            continue
+        candidate = Path(raw)
+        if candidate.is_absolute() and candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+    return None
+
+
+def sandbox_tools() -> tuple[str | None, str | None, str]:
+    original_path = os.environ.get("PATH", "")
+    unshare = shutil.which("unshare", path=original_path)
+    search_parts = [part for part in original_path.split(os.pathsep) if part]
+    for extra in ("/usr/sbin", "/sbin"):
+        if extra not in search_parts:
+            search_parts.append(extra)
+    child_path = os.pathsep.join(search_parts)
+    ip = shutil.which("ip", path=child_path)
+    return (
+        str(Path(unshare).resolve()) if unshare else None,
+        str(Path(ip).resolve()) if ip else None,
+        child_path,
+    )
+
+
+def hyperframes_owner_home(hyperframes: str) -> Path | None:
+    path = Path(hyperframes)
+    if path.parent.name == "bin" and path.parent.parent.name == ".local":
+        return path.parent.parent.parent
+    return None
+
+
+def hyperframes_child_path(base_path: str, hyperframes: str) -> str:
+    parts = [part for part in base_path.split(os.pathsep) if part]
+    if shutil.which("node", path=base_path) is not None:
+        return base_path
+    owner_home = hyperframes_owner_home(hyperframes)
+    candidates = [Path("/usr/local/bin/node"), Path("/usr/bin/node"), Path("/bin/node")]
+    if owner_home is not None:
+        candidates.extend(sorted(owner_home.glob(".nvm/versions/node/*/bin/node"), reverse=True))
+        candidates.append(owner_home / ".local" / "bin" / "node")
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            directory = str(candidate.parent)
+            if directory not in parts:
+                parts.append(directory)
+            break
+    return os.pathsep.join(parts)
+
+
+def prepare_hyperframes_home(home: Path, hyperframes: str) -> None:
+    owner_home = hyperframes_owner_home(hyperframes)
+    if owner_home is None:
+        return
+    installation = owner_home / ".local" / "share" / "hyperframes"
+    if not installation.is_dir():
+        return
+    share = home / ".local" / "share"
+    share.mkdir(parents=True)
+    (share / "hyperframes").symlink_to(installation, target_is_directory=True)
+
+
+def source_references(line: str) -> list[str]:
+    references = []
+    for pattern in (SOURCE_ATTRIBUTE_RE, CSS_URL_RE, CSS_IMPORT_RE, JS_IMPORT_RE):
+        for match in pattern.finditer(line):
+            value = match.groupdict().get("quoted") or match.groupdict().get("bare")
+            if value is not None:
+                references.append(value.strip())
+    return references
+
+
+def external_reference(value: str) -> bool:
+    lowered = value.lstrip().lower()
+    return lowered.startswith(("http://", "https://", "//"))
+
+
+def reference_escapes(project: Path, source: Path, value: str) -> bool:
+    if external_reference(value) or not value or value.startswith(("/", "#")):
+        return False
+    without_fragment = value.split("#", 1)[0].split("?", 1)[0]
+    if not without_fragment or ":" in without_fragment.split("/", 1)[0]:
+        return False
+    try:
+        candidate = (source.parent / without_fragment).resolve(strict=False)
+        return os.path.commonpath((str(project), str(candidate))) != str(project)
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
+def symlink_escapes(project: Path, path: Path) -> bool:
+    try:
+        target = path.resolve(strict=False)
+        return os.path.commonpath((str(project), str(target))) != str(project)
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
+def scan_project(project: Path) -> tuple[int, list[str], list[str]]:
+    files = []
+    path_findings: list[str] = []
+    for current, directories, names in os.walk(project, followlinks=False):
+        current_path = Path(current)
+        kept_directories = []
+        for name in sorted(directories):
+            if name in SKIPPED_PROJECT_DIRS:
+                continue
+            path = current_path / name
+            if path.is_symlink():
+                if symlink_escapes(project, path):
+                    path_findings.append(path.relative_to(project).as_posix())
+                continue
+            kept_directories.append(name)
+        directories[:] = kept_directories
+        for name in sorted(names):
+            path = current_path / name
+            if path.is_symlink() and symlink_escapes(project, path):
+                path_findings.append(path.relative_to(project).as_posix())
+                continue
+            if path.suffix.lower() in SCANNED_SUFFIXES:
+                files.append(path)
+
+    external_findings: list[str] = []
+    for path in files:
+        relative = path.relative_to(project).as_posix()
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as error:
+            raise CliError("input_invalid", "project file could not be read", 1) from error
+        for line_number, line in enumerate(lines, start=1):
+            location = f"{relative}:{line_number}"
+            references = source_references(line)
+            if NETWORK_CALL_RE.search(line) or any(external_reference(value) for value in references):
+                if location not in external_findings:
+                    external_findings.append(location)
+            if any(reference_escapes(project, path, value) for value in references):
+                if location not in path_findings:
+                    path_findings.append(location)
+    return len(files), external_findings, path_findings
+
+
+def checked_project(project: Path) -> int:
+    count, external_findings, path_findings = scan_project(project)
+    if path_findings:
+        raise CliError("path_escape", ", ".join(path_findings), 2)
+    if external_findings:
+        raise CliError("external_reference_blocked", ", ".join(external_findings), 2)
+    return count
 
 
 def dependencies(*, require_ffmpeg: bool) -> tuple[str | None, str]:
@@ -340,6 +557,71 @@ def output_result(root: Path, media_path: Path, output: Path, timeout: int) -> d
     return result
 
 
+def system_temp_parent(root: Path) -> Path:
+    candidates = (tempfile.gettempdir(), "/tmp", "/var/tmp")
+    for raw in candidates:
+        try:
+            candidate = Path(raw).resolve(strict=True)
+            inside = os.path.commonpath((str(root), str(candidate))) == str(root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not inside and candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK):
+            return candidate
+    raise CliError("render_failed", "system temporary directory is unavailable", 1)
+
+
+def render_failure_detail(stderr: bytes, stdout: bytes) -> str:
+    raw = stderr if stderr.strip() else stdout
+    detail = raw.decode("utf-8", "replace").strip()
+    return (detail or "hyperframes render failed")[:300]
+
+
+def run_render_process(
+    argv: list[str], cwd: Path, environment: dict[str, str], timeout: int
+) -> None:
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise CliError("render_failed", "hyperframes could not be executed", 1) from error
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise CliError("timeout", "render exceeded --timeout", 1) from error
+    if process.returncode != 0:
+        raise CliError("render_failed", render_failure_detail(stderr, stdout), 1)
+
+
+def place_rendered_output(source: Path, output: Path, overwrite: bool) -> None:
+    staged = temporary_output(output)
+    try:
+        with source.open("rb") as original, staged.open("wb") as destination:
+            shutil.copyfileobj(original, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        if output.exists() and not overwrite:
+            raise CliError("output_exists", "output already exists; use --overwrite", 2)
+        os.replace(staged, output)
+    except CliError:
+        raise
+    except OSError as error:
+        raise CliError("render_failed", "output could not be placed", 1) from error
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def produce(
     root: Path,
     output: Path,
@@ -390,6 +672,10 @@ def doctor_command(root: Path, arguments: argparse.Namespace) -> dict[str, Any]:
     except IndexError as error:
         raise CliError("dependency_missing", "media dependency version is unavailable", 1) from error
     writable = os.access(root, os.W_OK | os.X_OK)
+    hyperframes = configured_executable("HYPERFRAMES_BIN", "hyperframes")
+    unshare, ip, _ = sandbox_tools()
+    sandbox_available = unshare is not None and ip is not None
+    chrome = browser_executable()
     return {
         "ok": True,
         "ffmpeg": {
@@ -399,6 +685,107 @@ def doctor_command(root: Path, arguments: argparse.Namespace) -> dict[str, Any]:
         },
         "ffprobe": {"version": ffprobe_line},
         "root": {"path": str(root), "writable": writable},
+        "hyperframes": {"found": hyperframes is not None, "path": hyperframes},
+        "sandbox": {
+            "available": sandbox_available,
+            "method": "unshare" if sandbox_available else None,
+        },
+        "chrome": chrome,
+        "render_ready": hyperframes is not None and sandbox_available and chrome is not None,
+    }
+
+
+def check_command(root: Path, arguments: argparse.Namespace) -> dict[str, Any]:
+    project = validate_project(root, arguments.project)
+    files_scanned = checked_project(project)
+    return {"ok": True, "files_scanned": files_scanned, "findings": []}
+
+
+def render_command(root: Path, arguments: argparse.Namespace) -> dict[str, Any]:
+    project = validate_project(root, arguments.project)
+    checked_project(project)
+
+    unshare, ip, child_path = sandbox_tools()
+    if unshare is None or ip is None:
+        raise CliError("sandbox_unavailable", "unshare network sandbox is unavailable", 2)
+    hyperframes = configured_executable("HYPERFRAMES_BIN", "hyperframes")
+    if hyperframes is None:
+        raise CliError("dependency_missing", "hyperframes", 1)
+
+    output = validate_path(root, arguments.output, input_path=False)
+    extension(output, {".mp4"}, "render")
+    validate_output(output, arguments.overwrite)
+    chrome = browser_executable()
+    temporary_parent = system_temp_parent(root)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="mindalert-video-", dir=temporary_parent) as raw_temp:
+            temporary = Path(raw_temp)
+            project_copy = temporary / "project"
+            shutil.copytree(
+                project,
+                project_copy,
+                ignore=shutil.ignore_patterns(*SKIPPED_PROJECT_DIRS),
+                symlinks=True,
+            )
+            home = temporary / "home"
+            child_tmp = temporary / "tmp"
+            home.mkdir()
+            child_tmp.mkdir()
+            prepare_hyperframes_home(home, hyperframes)
+            rendered = temporary / "out.mp4"
+            child_environment = {
+                "HOME": str(home),
+                "PATH": hyperframes_child_path(child_path, hyperframes),
+                "LANG": os.environ.get("LANG") or "C.UTF-8",
+                "TMPDIR": str(child_tmp),
+                "HYPERFRAMES_NO_TELEMETRY": "1",
+                "DO_NOT_TRACK": "1",
+                "HYPERFRAMES_NO_UPDATE_CHECK": "1",
+            }
+            if chrome is not None:
+                child_environment["HYPERFRAMES_BROWSER_PATH"] = chrome
+            argv = [
+                unshare,
+                "--user",
+                "--map-root-user",
+                "--net",
+                "sh",
+                "-c",
+                'ip link set lo up; exec "$@"',
+                "sh",
+                hyperframes,
+                "render",
+                "--output",
+                str(rendered),
+            ]
+            run_render_process(argv, project_copy, child_environment, arguments.timeout)
+            if not rendered.is_file() or rendered.stat().st_size == 0:
+                raise CliError("render_failed", "hyperframes did not create an output", 1)
+            try:
+                info = probe_document(rendered, arguments.timeout)
+                duration = duration_of(info)
+                video = video_stream(info)
+            except CliError as error:
+                if error.code == "dependency_missing":
+                    raise
+                raise CliError("render_failed", "rendered output is not valid media", 1) from error
+            enforce_limit(duration, arguments.max_output_seconds)
+            size_bytes = rendered.stat().st_size
+            place_rendered_output(rendered, output, arguments.overwrite)
+    except CliError:
+        raise
+    except OSError as error:
+        raise CliError("render_failed", "temporary render workspace failed", 1) from error
+
+    return {
+        "output": output.relative_to(root).as_posix(),
+        "duration_seconds": duration,
+        "width": video.get("width"),
+        "height": video.get("height"),
+        "size_bytes": size_bytes,
+        "sandbox": "unshare",
+        "network": "blocked",
     }
 
 
@@ -595,6 +982,8 @@ def burn_subtitles_command(root: Path, arguments: argparse.Namespace) -> dict[st
 def dispatch(arguments: argparse.Namespace, root: Path) -> dict[str, Any]:
     handlers = {
         "doctor": doctor_command,
+        "check": check_command,
+        "render": render_command,
         "trim": trim_command,
         "concat": concat_command,
         "resize": resize_command,
