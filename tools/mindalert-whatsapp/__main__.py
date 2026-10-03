@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import json
 import os
 import re
 import socket
+import ssl
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -79,6 +81,21 @@ def redact(value: Any) -> Any:
 def emit_json(document: Any, stream) -> None:
     json.dump(redact(document), stream, ensure_ascii=False, separators=(",", ":"))
     stream.write("\n")
+
+
+def network_error_category(error: BaseException) -> str:
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "tls_verification_failed"
+    if isinstance(reason, socket.gaierror):
+        return "dns_failure"
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if getattr(reason, "errno", None) in {errno.ENETUNREACH, errno.EHOSTUNREACH}:
+        return "network_unreachable"
+    return "network_error_other"
 
 
 def validate_api_base(raw_base: str) -> str:
@@ -216,7 +233,10 @@ def api_call(
         raw = read_response_body(error)
         raise api_error(raw, error.code, error.headers) from error
     except (URLError, TimeoutError, socket.timeout, OSError) as error:
-        raise CliError("network_error", "WhatsApp API request failed", 3) from error
+        category = network_error_category(error)
+        raise CliError(
+            "network_error", f"WhatsApp API request failed ({category})", 3
+        ) from error
 
 
 def parser() -> SafeArgumentParser:

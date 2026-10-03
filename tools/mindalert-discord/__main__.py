@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import json
 import os
 import re
 import socket
+import ssl
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -55,6 +57,21 @@ class NoRedirects(HTTPRedirectHandler):
 def emit_json(document: Any, stream) -> None:
     json.dump(document, stream, ensure_ascii=False, separators=(",", ":"))
     stream.write("\n")
+
+
+def network_error_category(error: BaseException) -> str:
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "tls_verification_failed"
+    if isinstance(reason, socket.gaierror):
+        return "dns_failure"
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if getattr(reason, "errno", None) in {errno.ENETUNREACH, errno.EHOSTUNREACH}:
+        return "network_unreachable"
+    return "network_error_other"
 
 
 def redact(value: Any, secret: str) -> Any:
@@ -237,7 +254,10 @@ def api_call(
             1,
         ) from error
     except (URLError, TimeoutError, socket.timeout, OSError) as error:
-        raise CliError("network_error", "Discord API request failed", 3) from error
+        category = network_error_category(error)
+        raise CliError(
+            "network_error", f"Discord API request failed ({category})", 3
+        ) from error
 
 
 def parser() -> SafeArgumentParser:
